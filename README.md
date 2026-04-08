@@ -1,6 +1,25 @@
 # Stakpak Backup Validation Agent
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Stakpak Compatible](https://img.shields.io/badge/Stakpak-Compatible-blue)](https://stakpak.dev)
+[![MySQL](https://img.shields.io/badge/MySQL-8.0-orange)](https://mysql.com)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED)](https://docker.com)
+
 A **fully automated MySQL database backup validation system** powered by [Stakpak Autopilot](https://stakpak.dev). Built on top of a React + Node.js + MySQL CRUD application deployed on DigitalOcean.
+
+---
+
+## Features
+
+- **Automated Backups** — mysqldump on schedule with SHA256 checksums
+- **Integrity Validation** — Verify backup is not corrupted
+- **Staging Restore** — Test real database recovery process
+- **Completeness Checks** — All tables present, row counts match
+- **Consistency Checks** — NULL constraints, ENUMs, PKs, timestamps
+- **API Testing** — Full CRUD tests on staging app with restored data
+- **Slack Reports** — PASS/FAIL results posted automatically
+- **Zero Manual Work** — Fully autonomous, runs 24/7 on schedule
+- **Extensible** — Works with any MySQL database and application
 
 ---
 
@@ -150,6 +169,17 @@ GET    /api/tasks/:id   → 404 NOT FOUND (confirms deleted)
 **Security:** Multi-stage Docker builds, non-root containers, dumb-init, security headers, gzip, static caching
 
 ---
+
+## Requirements
+
+| Tool | Version |
+|------|---------|
+| Stakpak CLI | v0.3.73+ |
+| MySQL | 8.0+ |
+| Docker | 20.10+ |
+| bash | 4.0+ |
+| curl | any |
+| Node.js | 20 LTS |
 
 ## Prerequisites
 
@@ -325,8 +355,66 @@ Results are automatically posted to `#stakpak-agent-database`:
 
 ---
 
+## Security
+
+- All credentials stored in `.env` — never hardcoded
+- SHA256 checksums verify backup integrity before restore
+- Staging database fully isolated from production
+- All scripts use `set -euo pipefail` — fail fast on errors
+- Docker containers run as non-root users
+- Nginx security headers (CSP, X-Frame, nosniff)
+- `.env` and backup files excluded from git via `.gitignore`
+
+---
+
+## Extending
+
+### Add a different database
+1. Copy `.stakpak/scripts/01_create_backup.sh`
+2. Update the database name and credentials
+3. Create a new rulebook in `.stakpak/rulebooks/`
+4. Add a new schedule to `autopilot.toml`
+
+### Support other databases
+- **PostgreSQL** — replace `mysqldump` with `pg_dump`
+- **MongoDB** — replace with `mongodump`
+- **MariaDB** — works as-is (same CLI)
+
+---
+
+## Contributing
+
+Contributions welcome! Please:
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Commit your changes
+4. Open a Pull Request
+
+---
+
+## GitHub Repository Settings
+
+| Setting | Recommended Value |
+|---------|------------------|
+| Description | Automated MySQL backup validation with Stakpak Autopilot |
+| Topics | `stakpak`, `backup`, `mysql`, `automation`, `devops`, `docker` |
+| Visibility | Public |
+| Branch Protection | Require PR reviews on main |
+
+---
+
+## License
+
+MIT License — free to use, modify, and distribute.
+
+---
+
 ## Live Demo
 
 App: `http://157.230.221.18`
 
 GitHub: `https://github.com/0019-KDU/stakpak-backup-validation-agent`
+
+---
+
+If this project helps you, please star the repo!
