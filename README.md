@@ -42,30 +42,113 @@ Every day at **2:00 AM** (and a quick integrity check every 6 hours), the Stakpa
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│           STAKPAK AUTOPILOT                  │
-│   Cron: 0 2 * * *  →  daily-backup-validation│
-│   Cron: 0 */6 * * * → quick-integrity-check  │
-└─────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│         BASH SCRIPT ORCHESTRATOR             │
-│    /root/.stakpak/scripts/run_validation.sh  │
-└─────────────────────────────────────────────┘
-                      │
-     ┌────────┬────────┬────────┬────────┬────────┬──────┐
-     ▼        ▼        ▼        ▼        ▼        ▼      ▼
-  Step 1   Step 2   Step 3   Step 4   Step 5   Step 6  Step 7
-  Backup  Integrity Restore Complete Consistency Staging Report
-  Create   Check    to DB    Check    Check    App Test
-                      │
-                      ▼
-┌─────────────────────────────────────────────┐
-│              SLACK NOTIFICATION              │
-│   Channel: #stakpak-agent-database           │
-│   Full PASS/FAIL report posted automatically │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    STAKPAK AUTOPILOT                             │
+│  Cron: 0 2 * * *   →  daily-backup-validation                   │
+│  Cron: 0 */6 * * * →  quick-integrity-check                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              APPROVALS & GATEWAY (Slack Integration)             │
+│  approval_mode = "allow_all"  ← Auto-approves all tool calls    │
+│  sandbox = false              ← Runs on host, not in container  │
+│  delivery_context_ttl = 4 hrs ← Approval timeout                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   BASH SCRIPT ORCHESTRATOR                       │
+│            /root/.stakpak/scripts/run_validation.sh              │
+│  (Master script that runs all 7 validation steps in order)       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────┬─────────┬─────────┬─────────┬─────────┬──────┐
+        ▼         ▼         ▼         ▼         ▼         ▼      ▼
+    Step 1    Step 2    Step 3    Step 4    Step 5    Step 6  Step 7
+    CREATE  INTEGRITY  RESTORE  COMPLETE CONSISTENCY  STAGING  REPORT
+    BACKUP  VALIDATE   TO DB    CHECK    VALIDATE     APP TEST
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   EXTERNAL SYSTEMS                               │
+├─────────────────────────────────────────────────────────────────┤
+│ • MySQL Database (Production + Staging)                          │
+│ • Docker Containers (Staging Backend on port 5001)               │
+│ • Slack Channel (#stakpak-agent-database)                        │
+│ • File System (/root/.stakpak/backups/, /root/.stakpak/logs/)    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How It Works — Full Workflow
+
+### Scenario: Daily Backup Validation at 2 AM
+
+```
+1.  SCHEDULER FIRES
+    └─ Autopilot cron triggers at 0 2 * * * (2 AM UTC)
+    └─ Reads prompt: "Run the full database backup validation pipeline..."
+
+2.  AUTOPILOT CREATES SESSION
+    └─ Creates a new agent session
+    └─ Sets approval_mode to "allow_all" (auto-approve tools)
+    └─ Posts start message to Slack channel
+
+3.  AGENT RUNS ORCHESTRATOR
+    └─ Executes: bash /root/.stakpak/scripts/run_validation.sh
+    └─ Master script runs steps 1–7 sequentially, stops on first failure
+
+4.  STEP 1: CREATE BACKUP
+    └─ mysqldump → gzip → SHA256 checksum
+    └─ Output: /root/.stakpak/backups/backup_stakpak_agent_db_YYYYMMDD.sql.gz
+    └─ Also writes: .sha256 file + latest.txt pointer
+
+5.  STEP 2: INTEGRITY CHECK
+    └─ Reads latest.txt to find backup filename
+    └─ Verifies: SHA256 match + gzip OK + valid SQL structure
+    └─ If FAIL → stops here, reports FAIL to Slack
+
+6.  STEP 3: RESTORE TO STAGING
+    └─ Drops old stakpak_staging_db, creates fresh one
+    └─ zcat backup.sql.gz | mysql stakpak_staging_db
+    └─ If FAIL → stops, reports FAIL
+
+7.  STEP 4: COMPLETENESS CHECK
+    └─ Queries information_schema.tables in both databases
+    └─ Compares table list + row counts production vs staging
+    └─ If ANY mismatch → FAIL
+
+8.  STEP 5: CONSISTENCY CHECK (6 sub-checks)
+    └─ NULL violations     (title IS NULL)
+    └─ ENUM violations     (status NOT IN 'pending','in_progress','done')
+    └─ Duplicate PKs       (GROUP BY id HAVING COUNT > 1)
+    └─ Future timestamps   (created_at > NOW())
+    └─ Bad ordering        (updated_at < created_at)
+    └─ Empty titles        (TRIM(title) = '')
+    └─ If ANY violation → FAIL
+
+9.  STEP 6: STAGING APP TEST (7 API calls)
+    └─ docker compose up -d (staging backend on port 5001)
+    └─ Waits until GET /health returns 200
+    └─ Runs: GET /health, GET /api/tasks, POST, GET, PUT, DELETE, GET (404)
+    └─ docker compose down (clean up)
+    └─ If ANY test returns wrong HTTP code → FAIL
+
+10. STEP 7: GENERATE REPORT
+    └─ Reads /tmp/stakpak_validation_results.txt
+    └─ Builds formatted PASS/FAIL report
+    └─ Saves to /root/.stakpak/logs/validation-YYYYMMDD_HHMMSS.log
+    └─ Exits 0 (PASS) or 1 (FAIL)
+
+11. SLACK RECEIVES REPORT
+    └─ Autopilot gateway sends full report to #stakpak-agent-database
+    └─ Shows OVERALL PASS ✅ or OVERALL FAIL ❌ with all step details
+
+12. SESSION ENDS
+    └─ Run marked "completed" in autopilot history
+    └─ Next run scheduled for tomorrow at 2 AM
 ```
 
 ---
@@ -130,6 +213,61 @@ stakpak-backup-validation-agent/
 | 5 | `05_consistency_check.sh` | Consistency | 0 NULL violations, valid ENUMs, no duplicate PKs, valid timestamps |
 | 6 | `06_staging_app_test.sh` | App usability | All 7 API endpoints return correct HTTP codes |
 | 7 | `07_report.sh` | Final report | Compiles results + saves log + exits 0/1 |
+
+### Detailed Step Breakdown
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 1: CREATE BACKUP                                           │
+│ Inputs:  stakpak_agent_db (MySQL)                               │
+│ Process: mysqldump | gzip > backup.sql.gz                       │
+│ Outputs: backup file + SHA256 checksum + latest.txt             │
+│ Success: File exists, not zero bytes, checksum generated         │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 2: INTEGRITY CHECK                                         │
+│ Checks:  SHA256 matches + gzip decompresses + valid SQL struct  │
+│ Success: All checks pass                                        │
+│ Failure: Corrupted backup → STOP                                │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 3: RESTORE TO STAGING                                      │
+│ Process: DROP → CREATE stakpak_staging_db → restore backup      │
+│ Success: Staging DB has ≥1 table                                │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 4: COMPLETENESS CHECK                                      │
+│ Compares: Table list + row counts (production vs staging)       │
+│ Success: All tables present, all row counts match               │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 5: CONSISTENCY CHECK (6 sub-checks)                        │
+│ Check 1: NULL Violations       WHERE title IS NULL              │
+│ Check 2: ENUM Violations       WHERE status NOT IN (...)        │
+│ Check 3: Duplicate PKs         GROUP BY id HAVING COUNT > 1     │
+│ Check 4: Future Timestamps     WHERE created_at > NOW()         │
+│ Check 5: Bad Timestamp Order   WHERE updated_at < created_at    │
+│ Check 6: Empty Titles          WHERE TRIM(title) = ''           │
+│ Success: 0 violations across all 6 checks                       │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 6: STAGING APP TEST (7 API calls)                          │
+│ Setup:   docker compose up -d (port 5001, staging DB)           │
+│ Teardown: docker compose down (auto-cleanup on exit)            │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 7: GENERATE REPORT                                         │
+│ Reads:   /tmp/stakpak_validation_results.txt                    │
+│ Saves:   /root/.stakpak/logs/validation-YYYYMMDD_HHMMSS.log    │
+│ Exits:   0 = PASS, 1 = FAIL                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ### Step 6 API Tests (Staging App)
 
@@ -286,11 +424,11 @@ bash /root/.stakpak/scripts/02_integrity_check.sh
 ### Monitor runs
 
 ```bash
-# Check run history
-stakpak autopilot schedule history daily-backup-validation
-
 # Check autopilot status
 stakpak autopilot status
+
+# Check run history (last 5 runs)
+stakpak autopilot schedule history daily-backup-validation --limit 5
 
 # Test Slack connection
 stakpak autopilot channel test
@@ -298,6 +436,17 @@ stakpak autopilot channel test
 # View validation logs
 ls /root/.stakpak/logs/
 cat /root/.stakpak/logs/validation-YYYYMMDD_HHMMSS.log
+
+# View latest backup info
+cat /root/.stakpak/backups/latest.txt
+ls -lah /root/.stakpak/backups/
+
+# Stream autopilot service logs
+stakpak autopilot logs -n 50 -c scheduler   # Scheduler activity
+stakpak autopilot logs -n 50 -c server      # Gateway/approval activity
+
+# Watch next scheduled run in real time
+watch stakpak autopilot schedule history daily-backup-validation
 ```
 
 ### Redeploy after code changes
@@ -314,6 +463,54 @@ cat /root/.stakpak/logs/validation-YYYYMMDD_HHMMSS.log
 |----------|------|-----------|
 | `daily-backup-validation` | `0 2 * * *` | Full 7-step pipeline |
 | `quick-integrity-check` | `0 */6 * * *` | SHA256 checksum only |
+
+---
+
+## Integration Points
+
+### File System Layout (on droplet)
+
+```
+/root/.stakpak/
+├── backups/               ← Backup files stored here
+│   ├── backup_*.sql.gz
+│   ├── backup_*.sql.gz.sha256
+│   └── latest.txt         ← Points to latest backup filename
+├── logs/                  ← Validation reports saved here
+│   └── validation-YYYYMMDD_HHMMSS.log
+├── scripts/               ← 8 executable bash scripts
+├── staging/               ← Staging compose file
+│   └── docker-compose.yml
+├── .env                   ← Database credentials + paths
+├── autopilot.toml         ← Autopilot scheduling config
+└── rulebooks/
+    └── backup-validation.md  ← Procedure manual (SOP)
+```
+
+### Docker Stack Layout
+
+```
+Production Stack (always running):
+  ├─ Frontend container  (port 80)
+  ├─ Backend container   (port 5000)
+  └─ MySQL               (on host, not in Docker)
+
+Staging Stack (starts during Step 6, stops after):
+  ├─ Backend container   (port 5001, same image)
+  └─ MySQL staging DB    (on host, stakpak_staging_db)
+```
+
+### Slack Integration Flow
+
+```
+Stakpak Autopilot
+    ↓  (App Token — Socket Mode)
+Slack Bot connects to workspace
+    ↓
+Sends run start + final report to #stakpak-agent-database
+    ↓
+approval_mode = "allow_all" → no manual Allow click needed
+```
 
 ---
 
@@ -352,6 +549,47 @@ Results are automatically posted to `#stakpak-agent-database`:
 | Sandbox container failing | Known bug in v0.3.73 | Set `sandbox = false` in schedules |
 | API test connection refused | Staging backend slow to start | Increase health check retries |
 | MySQL access denied | Docker can't reach host MySQL | Grant `stakpak_user@'%'` and set `bind-address = 0.0.0.0` |
+| MySQL restore fails | Disk full or staging DB permissions | See detailed fix below |
+
+### Detailed Fixes
+
+**Run stuck in "running"**
+```bash
+stakpak autopilot schedule clean
+```
+
+**Backup file missing or empty**
+```bash
+cat /root/.stakpak/.env | grep BACKUP_DIR
+mkdir -p /root/.stakpak/backups && chmod 755 /root/.stakpak/backups
+mysql -u stakpak_user -p -e "SELECT COUNT(*) FROM stakpak_agent_db.tasks;"
+```
+
+**MySQL restore fails**
+```bash
+# Check available disk space
+df -h /root/.stakpak/backups/
+
+# Check staging DB exists
+mysql -u stakpak_user -p -e "SHOW DATABASES LIKE 'stakpak_staging%';"
+
+# Try manual restore
+zcat $(cat /root/.stakpak/backups/latest.txt) | \
+  mysql -u stakpak_user -p stakpak_staging_db
+```
+
+**API test connection refused**
+```bash
+docker ps | grep stakpak_staging
+docker logs stakpak_staging_backend
+curl -v http://localhost:5001/health
+```
+
+**Slack not receiving reports**
+```bash
+stakpak autopilot channel test
+# If fails: re-add channel with fresh tokens in autopilot.toml
+```
 
 ---
 
@@ -379,6 +617,20 @@ Results are automatically posted to `#stakpak-agent-database`:
 - **PostgreSQL** — replace `mysqldump` with `pg_dump`
 - **MongoDB** — replace with `mongodump`
 - **MariaDB** — works as-is (same CLI)
+
+---
+
+## System Status Summary
+
+| Component | Purpose | Technology | Notes |
+|-----------|---------|-----------|-------|
+| **Autopilot** | Schedule tasks, manage approvals | Stakpak Scheduler (Systemd) | 2 active schedules |
+| **Rulebook** | Document procedures & criteria | Markdown SOP | v1.0 |
+| **Bash Scripts** | Execute validation steps | Shell + MySQL CLI | 8 scripts |
+| **Database** | Store app data + backups | MySQL 8.0 (host) | Production + staging |
+| **Docker** | Run staging app + tests | Docker Compose | Staging on port 5001 |
+| **Slack** | Send reports, receive approvals | Slack Socket Mode API | Auto-approve mode |
+| **File Storage** | Store backups & logs | Local filesystem | `/root/.stakpak/` |
 
 ---
 
